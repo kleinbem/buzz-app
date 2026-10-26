@@ -76,6 +76,7 @@ import {
   HEARD_LIMIT,
   oldestFirst,
   readWindow,
+  MENTION_OVERLAP,
   MENTIONS,
   streamKey,
   streamKinds,
@@ -288,6 +289,10 @@ type Runner = {
    * other channels' traffic cannot push out one a replay sends again. Only the
    * `SEEN_CHANNELS` most recently active channels are kept. */
   readonly seenIn: Map<string, Set<string>>;
+  /** Mentions it was given, with their times, kept while a mention read can
+   * find them again. Any traffic pushes ids out of the seen sets, which only
+   * hold a count. */
+  readonly mentioned: Map<string, number>;
   /** Replayed events waiting, oldest first, until the agent has room for the
    * jobs each makes. */
   readonly backlog: PendingEvent[];
@@ -808,6 +813,7 @@ export class AgentRunners {
       later: [],
       seen: new Set(),
       seenIn: new Map(),
+      mentioned: new Map(),
       backlog: [],
       wrote: new Set(),
       working: 0,
@@ -1114,6 +1120,12 @@ export class AgentRunners {
           move(stream.key, { through: now });
         else reading.push(stream);
       }
+      // A mention older than the overlap before its checkpoint is not read
+      // again, so it need not be remembered.
+      const through =
+        this.checkpoints[streamKey(runner.key, MENTIONS)]?.through ?? now;
+      for (const [id, created] of runner.mentioned)
+        if (created < through - MENTION_OVERLAP) runner.mentioned.delete(id);
       // Mentions have their own pass, so watch work waiting for room never
       // holds up the next mention read.
       for (const mentions of [true, false]) {
@@ -1304,8 +1316,10 @@ export class AgentRunners {
               );
             progress(stream.key, window.checkpoint);
             const kinds = streamKinds(stream);
-            const events = window.events.filter((event) =>
-              kinds.includes(event.kind),
+            const events = window.events.filter(
+              (event) =>
+                kinds.includes(event.kind) &&
+                !(stream.mentions && runner.mentioned.has(event.id)),
             );
             let skipped = window.skipped;
             for (let index = 0; index < events.length; ) {
@@ -2076,6 +2090,8 @@ export class AgentRunners {
 
   /** Queues `job`, or drops it when the lane is full; returns whether queued. */
   private enqueue(runner: Runner, job: Job) {
+    if (job.trigger.type === "mention")
+      runner.mentioned.set(job.trigger.event.id, job.trigger.event.created_at);
     const now = Date.now();
     const lane = laneOf(job.trigger);
     const rate = runner.rates[lane];
