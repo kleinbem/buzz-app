@@ -3990,7 +3990,7 @@ async function leaveCommunity(
  * it as the main agent so the next available one is saved in its place. */
 async function handOnMainAgent(session: RelaySession, pubkey: string) {
   await session.agentChoices.refresh(true, { fresh: true });
-  forgetDefaultAgent(pubkey);
+  forgetDefaultAgent(pubkey, session);
 }
 function stillArchived(name: string) {
   return `${name} is still archived in this community, so it stays out of member lists and mentions there.`;
