@@ -1451,6 +1451,7 @@ function ChannelWorkspace({
               !requestedMessage || exact?.inTimeline ? navigation : undefined
             }
             onOpenThread={openThread}
+            hasThreadTab={tabState.hasThreadTab}
             revealMessageId={
               sent?.channelId === current.id ? sent.id : undefined
             }
