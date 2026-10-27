@@ -2881,7 +2881,7 @@ export function createRelaySession(
         requests.invalidate();
         repositories.clearHomes();
         agentLibrary.clear();
-        archives.clear();
+        archives.stale();
         workflows.interrupt();
         channels.staleHeads();
         unread.stale();
