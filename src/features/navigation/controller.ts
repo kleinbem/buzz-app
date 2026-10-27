@@ -73,11 +73,14 @@ export function createNavigationController(
     promise: Promise<OpenResult>;
     resolve: (result: OpenResult) => void;
     pending: boolean;
-    timer?: ReturnType<typeof setTimeout>;
+    timer?: ReturnType<typeof setTimeout> | undefined;
   };
   let disposed = false;
   let active: Operation;
   let snapshot: NavigationSnapshot;
+  // The deadline measures a presenter. None may exist yet (the first-run gate
+  // hides the app for minutes), so it runs only while one is attached.
+  let presenters = 0;
   let ingressRetry: (() => Promise<OpenResult>) | undefined;
   const listeners = new Set<() => void>();
   // Commit state and capture each caller's result before invoking external code.
@@ -117,6 +120,16 @@ export function createNavigationController(
     operation.pending = false;
     clearTimeout(operation.timer);
     operation.resolve(result);
+  }
+  function arm(operation: Operation) {
+    if (!presenters || !operation.pending || operation.timer) return;
+    operation.timer = setTimeout(
+      () =>
+        transaction(() => {
+          finish(operation, { status: "failed", reason: "timeout" });
+        }),
+      timeoutMs,
+    );
   }
   function finish(operation: Operation, result: OpenResult) {
     if (operation !== active || !operation.pending) return;
@@ -169,13 +182,7 @@ export function createNavigationController(
       finish(operation, { status: "failed", reason: "invalid-target" });
       return promise;
     }
-    operation.timer = setTimeout(
-      () =>
-        transaction(() => {
-          finish(operation, { status: "failed", reason: "timeout" });
-        }),
-      timeoutMs,
-    );
+    arm(operation);
     emit();
     return promise;
   }
@@ -277,6 +284,24 @@ export function createNavigationController(
   });
   return {
     navigation,
+    /**
+     * Host-only: a presenter now exists. The pending visit's deadline starts (or
+     * restarts) here and stops when the last presenter detaches, so an attempt
+     * nobody could present never times out, while one a presenter stalls on does.
+     */
+    attach() {
+      presenters++;
+      arm(active);
+      let attached = true;
+      return () => {
+        if (!attached) return;
+        attached = false;
+        presenters--;
+        if (presenters) return;
+        clearTimeout(active.timer);
+        active.timer = undefined;
+      };
+    },
     /** Normalize a pending presentation, not a new intent; never reset its deadline. */
     resolve(attempt: OpenAttempt, input: OpenTarget) {
       return transaction(() => {
