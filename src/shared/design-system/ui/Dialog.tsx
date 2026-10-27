@@ -1,3 +1,4 @@
+import { DialogBarMaterial } from "./DialogBarMaterial";
 import { Dialog as BaseDialog } from "@base-ui/react/dialog";
 import {
   AnimatePresence,
@@ -113,11 +114,7 @@ export function Dialog({
           className="buzz-dialog-header"
           data-chrome-spacing={chromeSpacing}
         >
-          <div aria-hidden="true" className="buzz-dialog-bar-material">
-            <span />
-            <span />
-            <span />
-          </div>
+          <DialogBarMaterial />
           <div className="buzz-dialog-heading">
             {step ? (
               <div className="text-label" aria-hidden="true">
@@ -204,11 +201,7 @@ export function Dialog({
           className="buzz-dialog-actions"
           data-chrome-spacing={chromeSpacing}
         >
-          <div aria-hidden="true" className="buzz-dialog-bar-material">
-            <span />
-            <span />
-            <span />
-          </div>
+          <DialogBarMaterial />
           {leadingActions && (
             <div className="buzz-dialog-leading-actions">{leadingActions}</div>
           )}
