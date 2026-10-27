@@ -29,12 +29,14 @@ import {
   fromOwner,
   teamPrompt,
 } from "./service";
-import type {
-  DecisionFailure,
-  DecisionResult,
-  Decisions,
-  DecisionBackend,
+import {
+  DecisionsService,
+  type DecisionFailure,
+  type DecisionRequest,
+  type DecisionResult,
 } from "../decisions/service";
+import { TypeSafeKey } from "../../bundled/typesafe/key";
+import { typesafeProvider } from "../../bundled/typesafe";
 import { CATCH_UP_PREFIX, readCheckpoints } from "./catch-up";
 import { fileStore, type AgentStore } from "./state";
 import { readInterrupted, writeInterrupted } from "./interrupted";
@@ -124,6 +126,18 @@ async function setup({
       ["auth", viewer, "", "f".repeat(128)] as const,
   );
   const activity = createLocalAgentActivity();
+  // The TypeSafe plugin on the real decisions service, over a fake key store.
+  const decisions = jev ? new DecisionsService(ctx, undefined) : undefined;
+  const typesafe = jev ? new TypeSafeKey(jev) : undefined;
+  if (typesafe) {
+    typesafe.load();
+    await ctx
+      .extend({ pluginOwner: { id: "buzz.typesafe", revision: "one" } })
+      .plugin((scope) =>
+        scope.decisions.registerProvider(typesafeProvider(typesafe)),
+      )
+      .await();
+  }
   const service = new AgentsService(
     ctx,
     client.communities,
@@ -131,8 +145,7 @@ async function setup({
     storage,
     authorize,
     activity,
-    jev,
-    jev,
+    decisions,
     binding,
   );
   const plugin = ctx.extend({
@@ -206,10 +219,14 @@ async function setup({
     ...(resumes ? { resumes } : {}),
   };
   plugin.agents.register(type);
-  await vi.waitFor(() => expect(service.snapshot().status).toBe("ready"));
+  await vi.waitFor(() => expect(service.snapshot().status).toBe("ready"), {
+    // Keep fake-clock advancement unchanged in the timer behavior cases.
+    interval: vi.isFakeTimers() ? 50 : 1,
+  });
   return {
     activity,
     service,
+    typesafe,
     type,
     native,
     storage,
@@ -272,7 +289,7 @@ it("creates an agent in the community shown, with its type's defaults, and publi
     "example/echo",
     "Echo",
   );
-  expect(native.publishProfile).toHaveBeenCalledWith(bot);
+  expect(native.publishProfile).toHaveBeenCalledWith(member(bot));
   expect(agent).toMatchObject({
     pubkey: bot,
     name: "Echo",
@@ -305,7 +322,7 @@ it("brings over an identity not already an agent, with its type's defaults and w
     viewer,
     "example/echo",
   );
-  expect(native.publishProfile).toHaveBeenCalledWith(sibling);
+  expect(native.publishProfile).toHaveBeenCalledWith(member(sibling));
   expect(agent).toMatchObject({
     pubkey: sibling,
     name: "Older",
@@ -389,7 +406,7 @@ it("imports a shared agent as a new identity with its name and picture, adopting
   );
   expect(native.port).not.toHaveBeenCalled();
   expect(native.setPicture).toHaveBeenCalledWith(
-    agent.pubkey,
+    member(agent.pubkey),
     "https://example.test/baymax.png",
   );
   expect(agent).toMatchObject({
@@ -472,6 +489,9 @@ const importOld = (service: AgentsService, pubkey: string) =>
   service.port({ source: "installed", pubkey, type: "example/echo" });
 const portedKeys = (native: ReturnType<typeof fakeNative>) =>
   native.port.mock.calls.map(([, pubkey]) => pubkey);
+/** The membership native is called with for an agent in the community. */
+const member = (pubkey: string, relay = "wss://relay.example.test") =>
+  expect.objectContaining({ pubkey, relay });
 const here = (pubkey: string, relay = "wss://relay.example.test") => ({
   pubkey,
   relay,
@@ -1008,7 +1028,7 @@ it("keeps handed-off activity local, and pulses typing in the thread until the t
     await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
     await settle();
     expect(activity.reader.work()[0]?.state).toBe("working");
-    expect(native.publish).toHaveBeenCalledWith(bot, {
+    expect(native.publish).toHaveBeenCalledWith(member(bot), {
       kind: 20002,
       content: "",
       tags: [
@@ -1099,7 +1119,7 @@ describe("a plugin's wake", () => {
         /^[0-9a-f]{64}$/,
       );
       await settle();
-      expect(native.publish).toHaveBeenCalledWith(bot, {
+      expect(native.publish).toHaveBeenCalledWith(member(bot), {
         kind: 20002,
         content: "",
         tags: [
@@ -1531,7 +1551,7 @@ it("keeps the in-flight run and the queue across edits; each job reads the agent
   });
   expect(held?.signal.aborted).toBe(false);
   await held?.agent.publish({ kind: 7, content: "+" });
-  expect(native.publish).toHaveBeenLastCalledWith(bot, {
+  expect(native.publish).toHaveBeenLastCalledWith(member(bot), {
     kind: 7,
     content: "+",
   });
@@ -2013,6 +2033,314 @@ it("opens no community for an agent list that arrives after it stopped", async (
   expect(service.snapshot().running).toEqual([]);
 });
 
+describe("an agent in several communities", () => {
+  /** Its key in other.example.test, which is not its home. */
+  const away = `${bot}@other.example.test`;
+  const mention = (id: string) =>
+    event(id, {
+      tags: [
+        ["h", channel],
+        ["p", bot],
+      ],
+    });
+  /** Echo, created in relay.example.test and added to other.example.test. */
+  async function joined(options: Parameters<typeof setup>[0] = {}) {
+    const ready = await setup(options);
+    const { service, select, second } = ready;
+    await service.create({ type: "example/echo", name: "Echo" });
+    select(second.origin);
+    await vi.waitFor(() =>
+      expect(service.joinable().map((agent) => agent.key)).toEqual([bot]),
+    );
+    const { agent } = await service.join(bot);
+    return { ...ready, agent };
+  }
+
+  it("joins with the same key, shares its settings, and keeps its own attention and runs", async () => {
+    const { service, native, run, emit, second, select, agent } =
+      await joined();
+    expect(agent).toMatchObject({
+      key: away,
+      pubkey: bot,
+      relay: "wss://other.example.test",
+      name: "Echo",
+    });
+    expect(native.create).toHaveBeenCalledOnce();
+    expect(native.join).toHaveBeenCalledWith(
+      bot,
+      "wss://relay.example.test",
+      "https://other.example.test",
+      undefined,
+    );
+    expect(service.joinable()).toEqual([]);
+    await expect(service.join(bot)).rejects.toThrow("Echo is already here");
+    // It starts here with nothing to pay attention to.
+    expect(service.find(bot)?.attention).toEqual({});
+    await service.save(away, {
+      config: { reply: "Shared." },
+      attention: {
+        "interest/here": { type: "interest", instructions: "Only here." },
+      },
+    });
+    // Each community runs it as its own membership.
+    second.emit({ events: [mention("there")] });
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    expect(run.mock.calls[0]?.[0].agent.key).toBe(away);
+    expect(run.mock.calls[0]?.[0].config).toEqual({ reply: "Shared." });
+    select("https://relay.example.test");
+    const home = service.find(bot);
+    expect(home?.key).toBe(bot);
+    expect(home?.config).toEqual({ reply: "Shared." });
+    expect(Object.keys(home?.attention ?? {}).sort()).toEqual([
+      "interest/default",
+      "watch/channel",
+    ]);
+    emit({ events: [mention("home")] });
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+    expect(run.mock.calls[1]?.[0].agent.key).toBe(bot);
+    // A rename is the agent's, everywhere.
+    await service.save(bot, { name: "Echo Two" });
+    expect(native.rename).toHaveBeenCalledWith(bot, "Echo Two");
+    expect(service.memberships(bot)).toEqual([
+      { key: bot, origin: "https://relay.example.test", connected: true },
+      { key: away, origin: "https://other.example.test", connected: true },
+    ]);
+  });
+
+  it("leaves one community and stays in its others, never its last, and comes back with its key", async () => {
+    const { service, native, second, agent } = await joined();
+    await service.save(agent.key, {
+      attention: {
+        "interest/here": { type: "interest", instructions: "Only here." },
+      },
+    });
+    steps.length = 0;
+    await service.leave(away);
+    expect(steps).toEqual([
+      "stop",
+      "channels",
+      "archive",
+      "record",
+      "key",
+      "forget",
+    ]);
+    expect(native.remove).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pubkey: bot,
+        relay: "wss://other.example.test",
+      }),
+    );
+    expect(service.find(bot)).toBeUndefined();
+    expect(service.memberships(bot)).toEqual([
+      { key: bot, origin: "https://relay.example.test", connected: true },
+    ]);
+    expect(forgetDefaultAgent).not.toHaveBeenCalled();
+    await expect(service.leave(bot)).rejects.toThrow(
+      "This is Echo's last community. Delete it to remove it here.",
+    );
+    // Added again, it has the same key, is unarchived, and what it paid
+    // attention to here is gone.
+    const back = await service.join(bot);
+    expect(back.agent.key).toBe(away);
+    expect(second.archives.request).toHaveBeenCalledWith(
+      "unarchive",
+      bot,
+      expect.any(AbortSignal),
+    );
+    expect(service.find(bot)?.attention).toEqual({});
+  });
+
+  it("deletes from every community, the one shown last, and forgets one it could not reach", async () => {
+    const { service, leave, select } = await joined();
+    select("https://relay.example.test");
+    leave("https://other.example.test");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(service.remove(bot)).rejects.toThrow(
+      "Echo isn't deleted yet and may still be in some channels. It stays stopped; Delete it again to finish. It is still in other.example.test.",
+    );
+    warn.mockRestore();
+    // It stays here, stopped, so the owner can give up on the other.
+    expect(leaveChannels).not.toHaveBeenCalled();
+    expect(service.find(bot)?.deleting).toBe(true);
+    expect(service.memberships(bot)).toEqual([
+      {
+        key: bot,
+        origin: "https://relay.example.test",
+        connected: true,
+        deleting: true,
+      },
+      {
+        key: away,
+        origin: "https://other.example.test",
+        connected: false,
+        deleting: true,
+      },
+    ]);
+    await service.forget(away);
+    expect(forgetDefaultAgent).not.toHaveBeenCalled();
+    await service.remove(bot);
+    expect(service.memberships(bot)).toEqual([]);
+    expect(forgetDefaultAgent).toHaveBeenCalledWith(bot);
+  });
+
+  it("lets one copy of the app at a time take it out of a community", async () => {
+    const identities: AgentIdentity[] = [];
+    const { service } = await joined({ identities });
+    // Another copy of the app, reading and writing the same native agents.
+    const other = await setup({ identities });
+    other.select(other.second.origin);
+    await vi.waitFor(() => expect(other.service.find(bot)?.key).toBe(away));
+    let release = () => {};
+    leaveChannels.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    const leaving = service.leave(away);
+    await vi.waitFor(() => expect(leaveChannels).toHaveBeenCalledOnce());
+    // Its Remove there meanwhile sends nothing to the community.
+    await expect(other.service.leave(away)).rejects.toThrow(
+      "Echo is being removed in another copy of the app. Try again once it's done.",
+    );
+    expect(leaveChannels).toHaveBeenCalledOnce();
+    expect(other.native.remove).not.toHaveBeenCalled();
+    release();
+    await leaving;
+    expect((await service.join(bot)).agent.key).toBe(away);
+  });
+
+  it("keeps its key in a community it joined after its home is left, in any copy of the app", async () => {
+    const { service, select, second } = await setup({
+      identities: [
+        {
+          pubkey: bot,
+          relay: "wss://other.example.test",
+          home: "wss://relay.example.test",
+          owner: viewer,
+          type: "example/echo",
+          name: "Echo",
+          deleted: false,
+        },
+      ],
+    });
+    select(second.origin);
+    await vi.waitFor(() => expect(service.find(bot)?.key).toBe(away));
+    expect(service.memberships(bot)).toEqual([
+      { key: away, origin: "https://other.example.test", connected: true },
+    ]);
+  });
+
+  it("stops it in a community it is still leaving, lists a rename there, then finishes leaving it", async () => {
+    const { service, native, run, second } = await joined();
+    second.emit({ events: [mention("there")] });
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    const turn = run.mock.calls[0]?.[0].agent;
+    // A reply waits on a chat its owner is still starting there.
+    let land = () => {};
+    vi.spyOn(second.session.channelWrites, "starting").mockImplementation(
+      () => new Promise<void>((resolve) => (land = resolve)),
+    );
+    const waiting = turn?.publish({
+      kind: 9,
+      content: "Waiting",
+      tags: [["h", channel]],
+    });
+    leaveChannels.mockRejectedValueOnce(new Error("offline"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(service.leave(away)).rejects.toThrow(
+      "Echo hasn't left other.example.test yet",
+    );
+    warn.mockRestore();
+    // Shown there, stopped: its plugins stop it, and a turn still working
+    // can't act as it.
+    expect(service.find(bot)).toMatchObject({ key: away, deleting: true });
+    expect(service.snapshot().running.map((agent) => agent.key)).toEqual([bot]);
+    await expect(
+      turn?.publish({ kind: 9, content: "Late", tags: [["h", channel]] }),
+    ).rejects.toThrow();
+    await expect(turn?.attention.show("interest/here")).rejects.toThrow();
+    land();
+    await expect(waiting).rejects.toThrow();
+    expect(native.publish).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ content: "Waiting" }),
+    );
+    records.publish.mockClear();
+    await service.save(bot, { name: "Echo Two" });
+    await vi.waitFor(() => expect(records.publish).toHaveBeenCalledOnce());
+    expect(records.publish).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ pubkey: bot, name: "Echo Two" }),
+      expect.anything(),
+    );
+    await settle();
+    expect(records.publish).toHaveBeenCalledOnce();
+    // Removing it there again finishes, and it stays here.
+    await service.leave(away);
+    expect(service.memberships(bot)).toEqual([
+      { key: bot, origin: "https://relay.example.test", connected: true },
+    ]);
+  });
+
+  it("keeps the agent held while another community's claim is still being answered", async () => {
+    const { service, native, run, select, second, connect } = await setup();
+    await service.create({ type: "example/echo", name: "Echo" });
+    await vi.waitFor(() => expect(native.claim).toHaveBeenCalledWith(bot));
+    // Its runner in the community it joins claims it, unanswered for now.
+    let answer = (_: boolean) => {};
+    native.claim.mockImplementationOnce(
+      () => new Promise<boolean>((resolve) => (answer = resolve)),
+    );
+    native.claim.mockClear();
+    select(second.origin);
+    await vi.waitFor(() =>
+      expect(service.joinable().map((agent) => agent.key)).toEqual([bot]),
+    );
+    await service.join(bot);
+    await vi.waitFor(() => expect(native.claim).toHaveBeenCalledOnce());
+    // Its home community goes away meanwhile.
+    connect(false);
+    await settle();
+    expect(native.release).not.toHaveBeenCalled();
+    answer(true);
+    second.emit({ events: [mention("there")] });
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    expect(run.mock.calls[0]?.[0].agent.key).toBe(away);
+    await settle();
+    expect(native.release).not.toHaveBeenCalled();
+  });
+
+  it("changes its type only while no community is running a turn", async () => {
+    const { service, native, run, ctx, second } = await joined();
+    ctx
+      .extend({ pluginOwner: Object.freeze({ id: "other", revision: "one" }) })
+      .agents.register<{ prompt: string }>({
+        id: "relay",
+        title: "Relay",
+        defaults: () => ({ config: { prompt: "" } }),
+        run: vi.fn(),
+      });
+    let finish = () => {};
+    run.mockImplementationOnce(async ({ workingUntil }) =>
+      workingUntil(new Promise<void>((resolve) => (finish = resolve))),
+    );
+    second.emit({ events: [mention("there")] });
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    // Its home runner is idle, but its turn here holds the change.
+    await expect(service.retype(bot, "other/relay")).rejects.toThrow(
+      "Echo is answering; change its type when it finishes",
+    );
+    expect(native.setType).not.toHaveBeenCalled();
+    finish();
+    await vi.waitFor(() =>
+      expect(service.sessionState(away, { channelId: channel })).not.toBe(
+        "working",
+      ),
+    );
+    await vi.waitFor(() => service.retype(bot, "other/relay"));
+    expect(native.setType).toHaveBeenCalledWith(bot, "other/relay");
+    expect(service.find(bot)?.type).toBe("other/relay");
+  });
+});
+
 it("keeps an agent running while its community reconnects, and stops it on disconnect or leave", async () => {
   const { service, connect, reconnecting, leave } = await setup();
   await service.create({ type: "example/echo", name: "Echo" });
@@ -2362,14 +2690,14 @@ it("sets and clears a picture through native, and publishes it", async () => {
   native.publishProfile.mockClear();
   const url = "https://relay.example/media/abc";
   await service.save(bot, { picture: url });
-  expect(native.setPicture).toHaveBeenCalledWith(bot, url);
+  expect(native.setPicture).toHaveBeenCalledWith(member(bot), url);
   expect(service.find(bot)?.picture).toBe(url);
-  expect(native.publishProfile).toHaveBeenCalledWith(bot);
+  expect(native.publishProfile).toHaveBeenCalledWith(member(bot));
   // An unchanged picture is not saved again; an empty one clears it.
   await service.save(bot, { picture: url });
   expect(native.setPicture).toHaveBeenCalledOnce();
   await service.save(bot, { picture: "" });
-  expect(native.setPicture).toHaveBeenLastCalledWith(bot, null);
+  expect(native.setPicture).toHaveBeenLastCalledWith(member(bot), null);
   expect(service.find(bot)?.picture).toBeUndefined();
 });
 
@@ -2386,7 +2714,7 @@ it("renames through native, and publishes profiles again on rename and reconnect
   await service.save(bot, { name: " Echo Two " });
   expect(native.rename).toHaveBeenCalledWith(bot, "Echo Two");
   expect(service.find(bot)?.name).toBe("Echo Two");
-  expect(native.publishProfile).toHaveBeenCalledWith(bot);
+  expect(native.publishProfile).toHaveBeenCalledWith(member(bot));
   // An unchanged name is not saved again.
   await service.save(bot, { name: "Echo Two", config: { reply: "new" } });
   expect(native.rename).toHaveBeenCalledOnce();
@@ -3030,7 +3358,10 @@ it("creates an agent with the config it was given, not its type's defaults, and 
     "example/echo",
     "Echo",
   );
-  expect(native.setPicture).toHaveBeenCalledExactlyOnceWith(bot, picture);
+  expect(native.setPicture).toHaveBeenCalledExactlyOnceWith(
+    member(bot),
+    picture,
+  );
   expect(agent).toMatchObject({ pubkey: bot, name: "Echo", picture });
   expect(agent.config).toEqual({ reply: "chosen" });
   expect(service.find(bot)).toMatchObject({
@@ -3615,7 +3946,7 @@ it("keeps an unfinished Delete stopped after a relaunch, and finishes it only wh
   expect(native.remove).not.toHaveBeenCalled();
   expect(records.remove).not.toHaveBeenCalled();
   await service.remove(bot);
-  expect(native.forget).toHaveBeenCalledWith(bot);
+  expect(native.forget).toHaveBeenCalledWith(member(bot));
   expect(service.find(bot)).toBeUndefined();
 });
 
@@ -3623,7 +3954,9 @@ it("after a relaunch, only drops the record and row of an agent left deleted", a
   const { service, native, archives } = await setup({
     identities: [{ ...here(bot), name: "Echo", deleted: true }],
   });
-  await vi.waitFor(() => expect(native.forget).toHaveBeenCalledWith(bot));
+  await vi.waitFor(() =>
+    expect(native.forget).toHaveBeenCalledWith(member(bot)),
+  );
   expect(steps).toEqual(["record", "forget"]);
   expect(leaveChannels).not.toHaveBeenCalled();
   expect(archives.consent).not.toHaveBeenCalled();
@@ -3797,7 +4130,9 @@ it("forgets an agent with no owner-attested profile without archiving it", async
   await service.create({ type: "example/echo", name: "Echo" });
   archives.consent.mockResolvedValueOnce(null);
   await service.remove(bot);
-  await vi.waitFor(() => expect(native.forget).toHaveBeenCalledWith(bot));
+  await vi.waitFor(() =>
+    expect(native.forget).toHaveBeenCalledWith(member(bot)),
+  );
   expect(archives.request).not.toHaveBeenCalled();
 });
 
@@ -3879,13 +4214,10 @@ it("runs once per matching watch, and passes a classifier watch it cannot classi
   expect(triggers[1]).not.toHaveProperty("interest");
 });
 
-/** The saved TypeSafe key and a decisions service whose answers the test
- * sets, on the `typesafe` backend unless the test chooses another. */
+/** Native TypeSafe: the saved key, and the answers the test sets. */
 function fakeJev(configured = true) {
   let key = configured;
-  let backend: DecisionBackend = "typesafe";
-  const listeners = new Set<() => void>();
-  const jev = {
+  return {
     status: vi.fn(async () => key),
     setKey: vi.fn(async (_: string) => {
       key = true;
@@ -3893,18 +4225,10 @@ function fakeJev(configured = true) {
     clearKey: vi.fn(async () => {
       key = false;
     }),
-    decide: vi.fn<Decisions["decide"]>(async () => yes),
-    backend: () => backend,
-    subscribe: (listener: () => void) => {
-      listeners.add(listener);
-      return () => void listeners.delete(listener);
-    },
-    use(next: DecisionBackend) {
-      backend = next;
-      for (const listener of [...listeners]) listener();
-    },
+    decide: vi.fn<(request: DecisionRequest) => Promise<unknown>>(
+      async () => yes,
+    ),
   };
-  return jev;
 }
 type FakeJev = ReturnType<typeof fakeJev>;
 const answered = (probability: number): DecisionResult => ({
@@ -3951,7 +4275,9 @@ async function classifiedAgent(jev: FakeJev) {
       },
     },
   });
-  return harness;
+  const { typesafe } = harness;
+  if (!typesafe) throw new Error("no TypeSafe key");
+  return { ...harness, typesafe };
 }
 
 it("runs a watch's classifier after its selectors and passes the event with each answer", async () => {
@@ -4008,7 +4334,7 @@ it("passes the event when the classifier fails, and says why", async () => {
       model: "jev-1.13.0",
       answers: {},
     })
-    .mockRejectedValueOnce(new Error("ipc"));
+    .mockRejectedValueOnce(new Error("invalid args"));
   const { run, emit } = await classifiedAgent(jev);
   emit({ events: [event("a"), event("b"), event("c")] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
@@ -4019,7 +4345,8 @@ it("passes the event when the classifier fails, and says why", async () => {
   ).toEqual([
     { outcome: "failed", reason: "timeout" },
     { outcome: "failed", reason: "invalid_response" },
-    { outcome: "failed", reason: "service_error" },
+    // Native refused the call's arguments.
+    { outcome: "failed", reason: "invalid_request" },
   ]);
 });
 
@@ -4037,14 +4364,14 @@ it("without a key the classifier does not run and the turn is told so", async ()
 
 it("a key set or cleared takes effect at once, and one removed elsewhere is noticed", async () => {
   const jev = fakeJev(false);
-  const { service, run, emit } = await classifiedAgent(jev);
-  await service.setClassifierKey("tk");
+  const { service, typesafe, run, emit } = await classifiedAgent(jev);
+  await typesafe.save("tk");
   expect(jev.setKey).toHaveBeenCalledWith("tk");
   expect(service.classifier()).toBe("available");
   expect(service.snapshot().classifier).toBe("available");
-  await service.clearClassifierKey();
+  await typesafe.clear();
   expect(service.classifier()).toBe("unavailable");
-  await service.setClassifierKey("tk");
+  await typesafe.save("tk");
   jev.decide.mockResolvedValueOnce(failure("missing_credentials"));
   emit({ events: [event("w")] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
@@ -4057,29 +4384,27 @@ it("a key set or cleared takes effect at once, and one removed elsewhere is noti
 it("shows a key it cannot read as unreadable, and one the service refuses as refused", async () => {
   const jev = fakeJev();
   jev.status.mockRejectedValueOnce(new Error("locked"));
-  const { service, run, emit } = await classifiedAgent(jev);
-  await vi.waitFor(() =>
-    expect(service.snapshot().classifierKey).toBe("unreadable"),
-  );
+  const { service, typesafe, run, emit } = await classifiedAgent(jev);
+  await vi.waitFor(() => expect(typesafe.snapshot()).toBe("unreadable"));
   // Unreadable is not missing: native is still asked, and its answer shows
   // the key is saved.
   emit({ events: [event("a")] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
   expect(jev.decide).toHaveBeenCalledOnce();
-  expect(service.snapshot().classifierKey).toBe("saved");
+  expect(typesafe.snapshot()).toBe("saved");
   jev.decide.mockResolvedValueOnce(failure("unauthorized"));
   emit({ events: [event("b")] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
   expect(run.mock.calls[1]?.[0].trigger).toMatchObject({
     classifier: { outcome: "failed", reason: "unauthorized" },
   });
-  expect(service.snapshot().classifierKey).toBe("refused");
+  expect(typesafe.snapshot()).toBe("refused");
   expect(service.classifier()).toBe("available");
   // Another failure does not say whether the key was accepted.
   jev.decide.mockResolvedValueOnce(failure("timeout"));
   emit({ events: [event("c")] });
   await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
-  expect(service.snapshot().classifierKey).toBe("refused");
+  expect(typesafe.snapshot()).toBe("refused");
 });
 
 it("does not run an event classified against a classifier changed since", async () => {
@@ -4167,16 +4492,14 @@ it("keeps a key removed while a call that used it ran shown as missing", async (
   jev.decide.mockImplementationOnce(
     () => new Promise((resolve) => (answer = resolve)),
   );
-  const { service, run, emit } = await classifiedAgent(jev);
-  await vi.waitFor(() =>
-    expect(service.snapshot().classifierKey).toBe("saved"),
-  );
+  const { service, typesafe, run, emit } = await classifiedAgent(jev);
+  await vi.waitFor(() => expect(typesafe.snapshot()).toBe("saved"));
   emit({ events: [event("w")] });
   await vi.waitFor(() => expect(jev.decide).toHaveBeenCalledOnce());
-  await service.clearClassifierKey();
+  await typesafe.clear();
   answer(yes);
   await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
-  expect(service.snapshot().classifierKey).toBe("missing");
+  expect(typesafe.snapshot()).toBe("missing");
   expect(service.classifier()).toBe("unavailable");
 });
 
@@ -4186,16 +4509,14 @@ it("keeps a key saved while an old key's call ran shown as saved, though the old
   jev.decide.mockImplementationOnce(
     () => new Promise((resolve) => (answer = resolve)),
   );
-  const { service, run, emit } = await classifiedAgent(jev);
-  await vi.waitFor(() =>
-    expect(service.snapshot().classifierKey).toBe("saved"),
-  );
+  const { typesafe, run, emit } = await classifiedAgent(jev);
+  await vi.waitFor(() => expect(typesafe.snapshot()).toBe("saved"));
   emit({ events: [event("w")] });
   await vi.waitFor(() => expect(jev.decide).toHaveBeenCalledOnce());
-  await service.setClassifierKey("new");
+  await typesafe.save("new");
   answer(failure("unauthorized"));
   await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
-  expect(service.snapshot().classifierKey).toBe("saved");
+  expect(typesafe.snapshot()).toBe("saved");
 });
 
 it("keeps a key saved before the first status read answers shown as saved", async () => {
@@ -4204,11 +4525,11 @@ it("keeps a key saved before the first status read answers shown as saved", asyn
   jev.status.mockImplementationOnce(
     () => new Promise<boolean>((resolve) => (known = resolve)),
   );
-  const { service } = await classifiedAgent(jev);
-  await service.setClassifierKey("tk");
+  const { typesafe } = await classifiedAgent(jev);
+  await typesafe.save("tk");
   known(false);
   await settle();
-  expect(service.snapshot().classifierKey).toBe("saved");
+  expect(typesafe.snapshot()).toBe("saved");
 });
 
 it("classifies a watched event of an agent whose community is not selected", async () => {
@@ -4318,7 +4639,7 @@ it("gives the classifier Buzz's thread parent: the marked reply, in any case; a 
     true,
   ]);
   expect(native.query).toHaveBeenCalledOnce();
-  expect(native.query).toHaveBeenCalledWith(bot, [
+  expect(native.query).toHaveBeenCalledWith(member(bot), [
     { ids: [parent.toLowerCase()], limit: 1 },
   ]);
 });
@@ -6195,9 +6516,18 @@ const record = (pubkey: string, patch: Partial<RelayEvent> = {}) =>
 const hostedKey = "e".repeat(64);
 function cloud() {
   const remote = {
-    provision: vi.fn(async (_: { name: string; community: string }) => ({
-      pubkey: hostedKey,
-    })),
+    provision: vi.fn(
+      async ({
+        picture,
+      }: {
+        name: string;
+        picture?: string;
+        community: string;
+      }): Promise<{ pubkey: string; picture?: string }> => ({
+        pubkey: hostedKey,
+        ...(picture ? { picture } : {}),
+      }),
+    ),
     activate: vi.fn(
       async (_: { pubkey: string; auth: readonly string[] }) => {},
     ),
@@ -6419,38 +6749,49 @@ it("retains hosted creation settings across restart and retries without provisio
   expect(storage.get("buzz.agents.unfinished.v1")).not.toContain("Revised.");
 });
 
-it("lists a hosted agent with the picture it was made with when its provider cannot publish it", async () => {
+it("makes a hosted agent with its picture and lists it with that picture", async () => {
   const { service, plugin, session } = await setup();
   const { type, remote } = cloud();
   plugin.agents.register(type);
-  remote.profile.mockRejectedValueOnce(new Error("not supported"));
-  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   const picture = "https://example.test/sky.png";
   const agent = await service.create({
     type: "example/cloud",
     name: "Sky",
     picture,
   });
+  expect(remote.provision).toHaveBeenCalledExactlyOnceWith({
+    name: "Sky",
+    picture,
+    community: "wss://relay.example.test",
+    signal: expect.any(AbortSignal),
+  });
   expect(records.publish).toHaveBeenCalledExactlyOnceWith(
     session,
     { pubkey: hostedKey, name: "Sky", picture, runtime: "example/cloud" },
     expect.any(AbortSignal),
   );
-  expect(remote.profile).toHaveBeenCalledWith({
-    pubkey: hostedKey,
-    community: "wss://relay.example.test",
-    name: "Sky",
-    picture,
-    signal: expect.any(AbortSignal),
-  });
+  // The provider publishes the picture it was made with when it activates.
+  expect(remote.profile).not.toHaveBeenCalled();
   expect(agent).toMatchObject({ pubkey: hostedKey, place: "hosted", picture });
   expect(service.find(hostedKey)?.picture).toBe(picture);
-  expect(remote.provision).toHaveBeenCalledTimes(1);
-  expect(warn).toHaveBeenCalledWith(
-    "Agent Sky picture was not published",
-    expect.any(Error),
-  );
-  warn.mockRestore();
+});
+
+it("lists a hosted agent with the picture the provider made it with", async () => {
+  const { service, plugin } = await setup();
+  const { type, remote } = cloud();
+  plugin.agents.register(type);
+  const original = "https://example.test/sky.png";
+  remote.provision.mockResolvedValueOnce({
+    pubkey: hostedKey,
+    picture: original,
+  });
+  const agent = await service.create({
+    type: "example/cloud",
+    name: "Sky",
+    picture: "https://example.test/sea.png",
+  });
+  expect(agent).toMatchObject({ pubkey: hostedKey, picture: original });
+  expect(service.find(hostedKey)?.picture).toBe(original);
 });
 
 it("keeps a hosted agent's picture through a setup that failed, and lists it once finished", async () => {
@@ -6535,6 +6876,35 @@ it("renames a hosted agent through its provider and relists it; its settings are
   await expect(service.save(hostedKey, { config: {} })).rejects.toThrow(
     /through its provider/,
   );
+});
+
+it("refuses to remove a hosted agent's picture, but still renames one that has none", async () => {
+  const { service, plugin } = await setup();
+  const { type, remote } = cloud();
+  plugin.agents.register(type);
+  const picture = "https://example.test/sky.png";
+  await service.create({ type: "example/cloud", name: "Sky", picture });
+  remote.profile.mockClear();
+  records.publish.mockClear();
+  for (const removal of ["", null]) {
+    await expect(service.save(hostedKey, { picture: removal })).rejects.toThrow(
+      /can't be removed yet/,
+    );
+  }
+  expect(remote.profile).not.toHaveBeenCalled();
+  expect(records.publish).not.toHaveBeenCalled();
+  expect(service.find(hostedKey)).toMatchObject({ picture });
+
+  await service.remove(hostedKey);
+  await service.create({ type: "example/cloud", name: "Sky" });
+  await service.save(hostedKey, { name: "Sea", picture: "" });
+  expect(remote.profile).toHaveBeenLastCalledWith({
+    pubkey: hostedKey,
+    community: "wss://relay.example.test",
+    name: "Sea",
+    signal: expect.any(AbortSignal),
+  });
+  expect(service.find(hostedKey)).toMatchObject({ name: "Sea" });
 });
 
 it("deletes a hosted agent from its provider, then from its community", async () => {
@@ -8614,7 +8984,7 @@ it.each(["other-channel", "missing"])(
     await settle();
     await settle();
     expect(run).not.toHaveBeenCalled();
-    expect(native.query).toHaveBeenCalledWith(bot, [
+    expect(native.query).toHaveBeenCalledWith(member(bot), [
       { ids: [root], kinds: [9, 40002], "#h": [channel], limit: 1 },
     ]);
     const attention = plugin.agents.handle(bot)?.attention;
@@ -8978,7 +9348,7 @@ it.each(["close", "unload", "abort"])(
       method: "tools/call",
       params: { name: "read", arguments: { channel } },
     });
-    expect(native.query).toHaveBeenCalledWith(bot, expect.any(Array));
+    expect(native.query).toHaveBeenCalledWith(member(bot), expect.any(Array));
     const result = await request({
       id: 2,
       method: "tools/call",
@@ -8989,7 +9359,7 @@ it.each(["close", "unload", "abort"])(
     });
     expect(result).not.toHaveProperty("result.isError", true);
     expect(native.remember).toHaveBeenCalledWith(
-      bot,
+      member(bot),
       "mem/source-test",
       "agent-owned output",
       expect.any(Number),
@@ -9441,13 +9811,13 @@ it.runIf(process.env.BUZZ_AGENT_COMMAND_BINARY)(
       await vi.waitFor(
         () => {
           expect(native.remember).toHaveBeenCalledWith(
-            bot,
+            member(bot),
             "mem/command-parent",
             "parent",
             expect.any(Number),
           );
           expect(native.remember).toHaveBeenCalledWith(
-            bot,
+            member(bot),
             "mem/command-child",
             "child",
             expect.any(Number),
@@ -9460,7 +9830,7 @@ it.runIf(process.env.BUZZ_AGENT_COMMAND_BINARY)(
       });
       expect(initialize).toBe(1);
       expect(
-        native.remember.mock.calls.every(([pubkey]) => pubkey === bot),
+        native.remember.mock.calls.every(([agent]) => agent.pubkey === bot),
       ).toBe(true);
       expect(run.mock.calls[0]?.[0].trigger).toMatchObject({
         type: "attention",
@@ -9740,7 +10110,7 @@ it.each([undefined, "d".repeat(64)])(
         },
       });
       expect(native.remember).toHaveBeenCalledWith(
-        owned,
+        member(owned),
         `mem/bound-${i}`,
         "own identity",
         expect.any(Number),
@@ -9753,7 +10123,7 @@ it.each([undefined, "d".repeat(64)])(
       });
       expect(read).not.toHaveProperty("result.isError", true);
       expect(native.query).toHaveBeenCalledWith(
-        owned,
+        member(owned),
         expect.arrayContaining([expect.objectContaining({ "#h": [channel] })]),
       );
       const filters = native.query.mock.calls.at(-1)?.[1];
@@ -9836,7 +10206,7 @@ it.each([
       } else {
         expect(result).not.toHaveProperty("result.isError", true);
         expect(native.publish).toHaveBeenCalledWith(
-          bot,
+          member(bot),
           expect.objectContaining({
             kind: 9,
             tags: expect.arrayContaining([

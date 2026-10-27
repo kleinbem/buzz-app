@@ -351,6 +351,7 @@ it("says when Pi has no provider for the choice", async () => {
 });
 
 const AGENT = {
+  key: "c".repeat(64),
   pubkey: "c".repeat(64),
   name: "pii",
   type: "buzz.pi/pi",
@@ -471,7 +472,7 @@ it("lists Pi's conversations in the Activity tab, and shows a transcript", async
   await user.click(screen.getByRole("button", { name: "Back to profile" }));
   await user.click(
     within(screen.getByRole("listitem")).getByRole("button", {
-      name: "View transcript",
+      name: "View transcript: other · channel",
     }),
   );
   expect(await screen.findByText("Hello from other")).toBeVisible();
