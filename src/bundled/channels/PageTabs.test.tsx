@@ -69,6 +69,7 @@ function fixture(visits?: boolean) {
     { id: "alpha", name: "alpha" },
     { id: "beta", name: "beta" },
     { id: "pending", name: "pending", cached: true },
+    { id: "dm", name: "Alice", channelType: "dm" as const },
   ];
   const list = { channels };
   const rows = { rows: [{ id: "root", content: "Root text" }] };
@@ -180,6 +181,28 @@ it("replaces the last opened tab unless asked to keep it", () => {
   expect(screen.getByText("conversation in beta")).toBeVisible();
   // Pages can depend on one opener across the renders its tabs cause.
   expect(page.openers.size).toBe(1);
+});
+
+it("gives each conversation tab its sidebar icon", () => {
+  const page = fixture();
+  expect(page.open({ channelId: "beta" })).toBe(true);
+  expect(page.open({ channelId: "dm" }, { keep: true })).toBe(true);
+  const list = screen
+    .getAllByRole("tablist")
+    .find((item) => item.getAttribute("aria-label") !== "Switchboard tabs");
+  expect(
+    within(list as HTMLElement)
+      .getAllByRole("tab")
+      .map(
+        (tab) =>
+          `${
+            tab
+              .querySelector("svg")
+              ?.getAttribute("class")
+              ?.match(/tabler-icon-[\w-]+/)?.[0]
+          } ${tab.textContent}`,
+      ),
+  ).toEqual(["tabler-icon-hash beta", "tabler-icon-message-circle Alice"]);
 });
 
 it("opens a thread moved to the main pane where it is", () => {
