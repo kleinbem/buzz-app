@@ -42,6 +42,7 @@ import {
   MenuIcon,
 } from "../../shared/design-system/ui/Menu";
 import { Header } from "../../shared/design-system/ui/Header";
+import { channelIcon } from "../../features/channels/channel-icon";
 import { NavigationItem } from "../../shared/design-system/ui/NavigationItem";
 import { Select } from "../../shared/design-system/ui/Select";
 import { Switch } from "../../shared/design-system/ui/Switch";
@@ -855,9 +856,15 @@ function WorkflowChannelCards({
 
   if (!snapshot.data.items.length && !snapshot.data.partial) return null;
 
+  const Icon = channelIcon(channel);
   return (
     <section className="workflow-channel-group" aria-labelledby={headingId}>
-      <Header id={headingId} level={2} title={`#${channel.name}`} />
+      <Header
+        id={headingId}
+        level={2}
+        icon={<Icon size={24} />}
+        title={channel.name}
+      />
       <SettingsGroup>
         {snapshot.data.items.map((definition) => {
           const key = workflowKey(definition);

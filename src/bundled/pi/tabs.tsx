@@ -13,6 +13,7 @@ import { AgentInstructions } from "../../features/agents/AgentInstructions";
 import { AgentSaveButton } from "../../features/agents/AgentSaveButton";
 import { ModelPicker } from "../../features/agents/ModelPicker";
 import {
+  ConversationName,
   OpenedConversation,
   useOpenedSession,
   useOpenTranscript,
@@ -77,7 +78,7 @@ const providerIcon = (id: string | undefined) => {
 };
 const CONVERSATION_LIMIT = 30;
 const label = ({ channelId, name, root }: Place) =>
-  `${name ? `#${name}` : channelId.slice(0, 8)} · ${root ? `thread ${root.slice(0, 8)}` : "channel"}`;
+  `${name || channelId.slice(0, 8)} · ${root ? `thread ${root.slice(0, 8)}` : "channel"}`;
 type Read<T> = (
   | { status: "loading"; value?: T }
   | { status: "ready"; value: T }
@@ -771,9 +772,15 @@ export function createTabs({
                   className="flex items-center justify-between gap-2"
                 >
                   <span className="min-w-0">
-                    <span className="block truncate">{label(place)}</span>
+                    <ConversationName session={place} title={label(place)} />
                     <span className="block text-body-sm text-subtle">
-                      {[status(place), new Date(place.at).toLocaleString()]
+                      {[
+                        place.root
+                          ? `Thread ${place.root.slice(0, 8)}`
+                          : "Channel",
+                        status(place),
+                        new Date(place.at).toLocaleString(),
+                      ]
                         .filter(Boolean)
                         .join(" · ")}
                     </span>

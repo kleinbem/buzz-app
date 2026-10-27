@@ -95,7 +95,7 @@ function Fixture() {
                     fixture.capability.delete(definition)
                   }
                   channelId={fixtureChannel}
-                  channelName="Fixture channel"
+                  channel={{ name: "Fixture channel" }}
                   initialSelection={opened}
                   onClose={() => setOpened(undefined)}
                   viewer={fixtureViewer}

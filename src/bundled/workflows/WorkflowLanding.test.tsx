@@ -169,7 +169,7 @@ it("groups repeated workflows by channel identity in channel-name order", async 
     const groups = screen.getAllByRole("region");
     expect(
       groups.map((group) => within(group).getByRole("heading").textContent),
-    ).toEqual(["#Alpha", "#Alpha", "#Zulu"]);
+    ).toEqual(["Alpha", "Alpha", "Zulu"]);
     expect(
       groups.map(
         (group) =>
