@@ -231,6 +231,20 @@ the end at the end, and the measured end renders in the same frame. Measured
 lists, shifts and readers above the end keep stock policy. Installed-store
 regressions cover both sides of that boundary.
 
+## First sizes at the end
+
+A channel opens at its end, and Virtua mounts the rows there at its 40px
+estimate. Their first sizes are usually larger. Stock Virtua keeps the estimated
+start of the viewport's first row, so the render after that batch mounts rows
+near the old start, and the timeline's end alignment then mounts the end again.
+On the perf fixture's 20-row head that is 24 row mounts for 4 settled rows.
+
+While the list still estimates, a batch that arrives with the viewport resting
+at the list end keeps that end instead, as a shift does: the batch's jump keeps
+the distance from the end, and the render mounts the end rows that are already
+mounted. Lists that are not at their end, and every batch once the list has
+measured rows, keep the stock policy. Installed-store regressions cover both.
+
 ## Automated checks
 
 ```sh
