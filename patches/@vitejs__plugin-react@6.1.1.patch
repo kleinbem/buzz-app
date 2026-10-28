@@ -1,0 +1,45 @@
+diff --git a/dist/index.js b/dist/index.js
+index 82e7bf8a28dc7b882eb77aa5ec6750567a9159d5..336bb2f7a039f29bb6bb835dfbd3cb81da19ada1 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -191,9 +191,40 @@ function viteReact(opts = {}) {
+ 			isEnabled: () => !skipFastRefresh && !isBundledDev
+ 		})
+ 	];
++	if (opts.compiler === void 0) plugins.unshift(createBabelReactCompilerPlugin(include, exclude));
+ 	if (opts.compiler) plugins.unshift(createReactCompilerPlugin(opts.compiler === true ? {} : opts.compiler, include, exclude, opts, () => !skipFastRefresh));
+ 	return plugins;
+ }
++function createBabelReactCompilerPlugin(include, exclude) {
++	const pending = import("@rolldown/plugin-babel").then(({ default: babel }) => babel({ presets: [reactCompilerPreset()] }));
++	let inner;
++	return {
++		name: "vite:react-compiler-babel",
++		enforce: "pre",
++		async config(...args) {
++			inner = await pending;
++			return inner.config.apply(this, args);
++		},
++		configResolved(...args) {
++			return inner.configResolved.apply(this, args);
++		},
++		applyToEnvironment(...args) {
++			return inner.applyToEnvironment.apply(this, args);
++		},
++		transform: {
++			filter: {
++				id: {
++					include: makeIdFiltersToMatchWithQuery(include),
++					exclude: makeIdFiltersToMatchWithQuery(exclude)
++				},
++				code: defaultCodeFilter
++			},
++			handler(...args) {
++				return inner.transform.handler.apply(this, args);
++			}
++		}
++	};
++}
+ function createReactCompilerPlugin({ logDiagnostics, ...reactCompilerOptions }, include, exclude, reactOptions, isFastRefreshEnabled) {
+ 	let jsxDevelopment = false;
+ 	let compiler;
