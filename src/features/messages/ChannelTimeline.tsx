@@ -110,11 +110,15 @@ function positionAt(
     else end = middle;
   }
   const reached = mounted.slice(first);
+  // Text that starts below the viewport is followed only by lower text.
+  let below = false;
   // Otherwise prefer a whole visible message over a partly clipped row.
   const row =
     restored ??
     reached.find((row) => {
+      if (below) return false;
       const text = row.querySelector("p")?.getBoundingClientRect();
+      if (text && text.top > top + element.clientHeight) below = true;
       return (
         text && text.top >= top && text.bottom <= top + element.clientHeight
       );
