@@ -890,8 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn larger_output_requires_a_bounded_manifest_opt_in() {
-        let (_directory, path) =
-            executable("/usr/bin/head -c 5000 /dev/zero | /usr/bin/tr '\\000' x");
+        let (_directory, path) = executable("head -c 5000 /dev/zero | tr '\\000' x");
         let mut command = super::HostCommand {
             id: "inventory".into(),
             program: "env".into(),
@@ -1078,9 +1077,10 @@ mod tests {
         let interpreter = directory.path().join("fixture-runtime");
         crate::test_executable::write_executable(&interpreter, "#!/bin/sh\nexec /bin/sh \"$@\"\n");
         let tool = directory.path().join("tool");
+        let env = crate::test_executable::on_path("env");
         crate::test_executable::write_executable(
             &tool,
-            "#!/usr/bin/env fixture-runtime\nprintf 'ready\\n'\n",
+            format!("#!{} fixture-runtime\nprintf 'ready\\n'\n", env.display()),
         );
         let path =
             std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin"), directory.path()])

@@ -16,7 +16,7 @@ pub(crate) fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
     source.push(".source");
     let source = Path::new(&source);
     std::fs::write(source, contents).unwrap();
-    let status = std::process::Command::new("/bin/cp")
+    let status = std::process::Command::new("cp")
         .arg(source)
         .arg(path)
         .status()
@@ -24,6 +24,17 @@ pub(crate) fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
     assert!(status.success(), "could not copy {}", path.display());
     std::fs::remove_file(source).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// The absolute path of `name` on the test's own `PATH`, for fixtures that
+/// must name a tool by path (a shebang, a command typed into a shell whose
+/// `PATH` the code under test sets).
+#[cfg(unix)]
+pub(crate) fn on_path(name: &str) -> std::path::PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("no {name} on PATH"))
 }
 
 /// Windows has no fork, so a plain write cannot leak a descriptor.
